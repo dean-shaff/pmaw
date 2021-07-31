@@ -1,9 +1,12 @@
+import asyncio
 import time
-import requests
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import logging
+
+import aiohttp
+import requests
 
 from pmaw.RateLimit import RateLimit
 from pmaw.Request import Request
@@ -44,18 +47,57 @@ class PushshiftAPIBase(object):
         if interval > 0:
             time.sleep(interval)
 
+    def update_metadata_from_response(self, resp_json: dict) -> None:
+        self.metadata_ = resp_json.get('metadata', {})
+        total_results = self.metadata_.get('total_results', None)
+        if total_results:
+            after, before = None, None
+            for param in self.metadata_['ranges']:
+                created = param['range']['created_utc']
+                if created.get('gt', None):
+                    after = created['gt']
+                elif created.get('lt', None):
+                    before = created['lt']
+            if after and before:
+                self.resp_dict[(after, before)] = total_results
+
+    async def _async_get(self, session, url, payload=None):
+        interval = self._rate_limit.delay()
+        log.debug(f"_async_get: {interval=}")
+        if interval > 0:
+            await asyncio.sleep(interval)
+
+        if payload is None:
+            payload = {}
+        log.debug(f"_async_get: {session=}, {url=}, {payload=}")
+        payload = {key: value for key, value in payload.items() if value is not None}
+        async with session.get(url, params=payload) as resp:
+            status = resp.status
+            if status == 200:
+                r = await resp.json()
+                # check if shards are down
+                self.update_metadata_from_response(r)
+                return r['data'], url, payload
+            else:
+                reason = resp.reason
+                err = RuntimeError(f"HTTP {status} -- {reason}")
+                err.args = (url, payload)
+                raise err
+
     def _get(self, url, payload={}):
         self._impose_rate_limit()
         r = requests.get(url, params=payload)
         status = r.status_code
         reason = r.reason
-
+        log.debug(f"_get: {r.url=}")
         if status == 200:
             r = json.loads(r.text)
 
             # check if shards are down
             self.metadata_ = r.get('metadata', {})
+            log.debug(f"_get: {self.metadata_=}")
             total_results = self.metadata_.get('total_results', None)
+            log.debug(f"_get: {total_results=}")
             if total_results:
                 after, before = None, None
                 for param in self.metadata_['ranges']:
@@ -80,7 +122,8 @@ class PushshiftAPIBase(object):
 
     def _multithread(self, check_total=False):
         executor = ThreadPoolExecutor(max_workers=self.num_workers)
-
+        log.debug(f"_multithread: {check_total=}")
+        log.debug(f"_multithread: {len(self.req.req_list)=}")
         while len(self.req.req_list) > 0 and not self.req.exit.is_set():
             # reset resp_dict which tracks remaining responses for timeslices
             self.resp_dict = {}
@@ -93,8 +136,7 @@ class PushshiftAPIBase(object):
                 for i in range(min(len(self.req.req_list), self.batch_size)):
                     reqs.append(self.req.req_list.popleft())
 
-            futures = {executor.submit(
-                self._get, url_pay[0], url_pay[1]): url_pay for url_pay in reqs}
+            futures = {executor.submit(self._get, url_pay[0], url_pay[1]): url_pay for url_pay in reqs}
 
             self._futures_handler(futures, check_total)
 
@@ -123,6 +165,7 @@ class PushshiftAPIBase(object):
         self._shutdown(executor)
 
     def _futures_handler(self, futures, check_total):
+        log.debug(f"_futures_handler: {len(futures)=}, {check_total=}")
         for future in as_completed(futures):
             url_pay = futures[future]
             self.num_req += int(not check_total)
@@ -199,6 +242,134 @@ class PushshiftAPIBase(object):
         self.num_req = 0
         self.num_batches = 0
 
+    async def _check_total(self, session):
+        url, payload = self.req.req_list.popleft()
+        log.debug(f"_check_total: {url=}, {payload=}")
+        await self._async_get(session, url, payload=payload)
+
+    def _reslice(self, data, url, payload):
+        before = payload['before']
+        after = payload['after']
+        log.debug(
+            f"Time slice from {after} - {before} returned {len(data)} results")
+        total_results = self.resp_dict.get(
+            (after, before), 0)
+        log.debug(
+            f'{total_results} total results for this time slice')
+        # calculate remaining results
+        remaining = total_results - len(data)
+
+        # number of timeslices is depending on remaining results
+        if remaining > self.req.max_results_per_request*2:
+            num = 2
+        elif remaining > 0:
+            num = 1
+        else:
+            num = 0
+
+        if num > 0:
+            # find minimum `created_utc` to set as the `before` parameter in next timeslices
+            before = data[-1]['created_utc']
+
+            # generate payloads
+            self.req.gen_slices(
+                url, payload, after, before, num)
+
+    async def _process_request_queue(self, session):
+
+        self.resp_dict = {}
+        awaitables = []
+        for i in range(min(len(self.req.req_list), self.batch_size)):
+            url, payload = self.req.req_list.popleft()
+            awaitables.append(self._async_get(session, url, payload))
+        log.debug(f"_process_request_queue: {len(awaitables)=}")
+        results = await asyncio.gather(*awaitables, return_exceptions=True)
+
+        for result in results:
+            self.num_req += 1
+            try:
+                self.num_suc += 1
+                data, url, payload = result
+                self.req.save_resp(data)
+                if 'before' in payload and 'after' in payload:
+                    self._reslice(data, url, payload)
+            except TypeError:
+                url, payload = result.args
+                self._rate_limit._req_fail()
+                self.req.req_list.appendleft((url, payload))
+
+        if len(self.req.req_list) > 0:
+            await self._process_request_queue(session)
+
+    async def _async_search(
+        self, kind,
+        max_ids_per_request=1000,
+        max_results_per_request=100,
+        mem_safe=False,
+        search_window=365,
+        dataset='reddit',
+        safe_exit=False,
+        **kwargs
+    ):
+        log.debug((f"_async_search: {kind=}, {max_ids_per_request=}, "
+                   f"{max_results_per_request=}, {mem_safe=}, "
+                   f"{search_window=}, {dataset=}, {safe_exit=}"))
+        # raise error if aggs are requested
+        if 'aggs' in kwargs:
+            err_msg = "Aggregations support for {} has not yet been implemented, please use the PSAW package for your request"
+            raise NotImplementedError(err_msg.format(kwargs['aggs']))
+
+        self.metadata_ = {}
+        self.req = Request(
+            copy.deepcopy(kwargs),
+            kind,
+            max_results_per_request,
+            max_ids_per_request,
+            mem_safe,
+            safe_exit
+        )
+
+        self._reset()
+
+        if kind == 'submission_comment_ids':
+            endpoint = f'{dataset}/submission/comment_ids/'
+        else:
+            endpoint = f'{dataset}/{kind}/search'
+
+        url = self.base_url.format(endpoint=endpoint)
+        async with aiohttp.ClientSession() as session:
+            while self.req.limit is None or self.req.limit > 0:
+                # set/update limit
+                if 'ids' not in self.req.payload and len(self.req.req_list) == 0:
+                    log.debug("_search: checking for total in elastic")
+                    # check to see how many results are remaining
+                    self.req.req_list.appendleft((url, self.req.payload))
+                    try:
+                        await self._check_total(session)
+                    except Exception as err:
+                        log.debug(f"Request Failed -- {err}")
+                        self._rate_limit._req_fail()
+                        continue
+                    total_avail = self.metadata_.get('total_results', 0)
+
+                    if self.req.limit is None:
+                        print(f'{total_avail} result(s) available in Pushshift')
+                        self.req.limit = total_avail
+                    elif (total_avail < self.req.limit):
+                        print(f'{self.req.limit - total_avail} result(s) not found in Pushshift')
+                        self.req.limit = total_avail
+                log.debug("_search: getting results from elastic")
+
+                # generate payloads
+                self.req.gen_url_payloads(
+                    url, self.batch_size, search_window)
+
+                if self.req.limit > 0 and len(self.req.req_list) > 0:
+                    await self._process_request_queue(session)
+
+            self.req.save_cache()
+            return self.req.resp
+
     def _search(self,
                 kind,
                 max_ids_per_request=1000,
@@ -208,7 +379,9 @@ class PushshiftAPIBase(object):
                 dataset='reddit',
                 safe_exit=False,
                 **kwargs):
-
+        log.debug((f"_search: {kind=}, {max_ids_per_request=}, "
+                   f"{max_results_per_request=}, {mem_safe=}, "
+                   f"{search_window=}, {dataset=}, {safe_exit=}"))
         # raise error if aggs are requested
         if 'aggs' in kwargs:
             err_msg = "Aggregations support for {} has not yet been implemented, please use the PSAW package for your request"
@@ -217,7 +390,8 @@ class PushshiftAPIBase(object):
         self.metadata_ = {}
         self.req = Request(copy.deepcopy(kwargs), kind,
                            max_results_per_request, max_ids_per_request, mem_safe, safe_exit)
-
+        log.debug(f"_search: {len(self.req.req_list)=}")
+        log.debug(f"_search: {self.req.payload=}")
         # reset stat tracking
         self._reset()
 
@@ -231,6 +405,7 @@ class PushshiftAPIBase(object):
         while (self.req.limit is None or self.req.limit > 0) and not self.req.exit.is_set():
             # set/update limit
             if 'ids' not in self.req.payload and len(self.req.req_list) == 0:
+                log.debug("_search: checking for total in elastic")
                 # check to see how many results are remaining
                 self.req.req_list.appendleft((url, self.req.payload))
                 self._multithread(check_total=True)
@@ -242,6 +417,8 @@ class PushshiftAPIBase(object):
                 elif (total_avail < self.req.limit):
                     print(f'{self.req.limit - total_avail} result(s) not found in Pushshift')
                     self.req.limit = total_avail
+
+            log.debug("_search: getting results from elastic")
 
             # generate payloads
             self.req.gen_url_payloads(

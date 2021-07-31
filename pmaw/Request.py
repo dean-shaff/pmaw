@@ -108,6 +108,7 @@ class Request(object):
                 payload['filter'].append('created_utc')
 
     def gen_slices(self, url, payload, after, before, num):
+        log.debug(f"gen_slices: {after=}, {before=}, {num=}")
         # create time slices
         ts = timeslice(after, before, num)
         url_payloads = [(url, mapslice(copy.deepcopy(payload),
@@ -116,6 +117,8 @@ class Request(object):
 
     def gen_url_payloads(self, url, batch_size, search_window):
         """Creates a list of url payload tuples"""
+        log.debug(f"gen_url_payloads: {url=}, {batch_size=}, {search_window=}")
+
         url_payloads = []
 
         # check if new payloads have to be made
